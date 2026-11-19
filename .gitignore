@@ -1,0 +1,7 @@
+# The hand-in directory main.ts writes: game/ and screenshots/ copied beside dossier.json.
+out/
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+node_modules/

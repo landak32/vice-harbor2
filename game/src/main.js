@@ -1,134 +1,217 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// Boot and the one loop. The world advances in fixed 1/60 s steps whatever the display does, the
+// renderer paints one letterboxed 1280x720 frame, and the menu state machine sits on top. With
+// ?shot=<name>&seed=<n> the page stages a real scene instead and paints it once for a screenshot.
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+import { Game } from './game.js';
+import { createRenderer } from './render/scene-renderer.js';
+import { KeyboardMouse } from './core/keyboard-mouse.js';
+import { stageScene } from './shots/staged-scenes.js';
+import { retryMission } from './systems/mission-story.js';
+
+const STEP = 1 / 60;
+const MAX_FRAME = 0.2;
 
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
+const shotName = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seed = Number.isInteger(seedParam) ? seedParam : 20261119;
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const statusLine = document.getElementById('status');
+const game = new Game(seed);
 const renderer = createRenderer(canvas);
+const input = new KeyboardMouse(canvas);
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+// A small handle for debugging and for the screenshot harness to wait on.
+window.__viceHarbor = { game, renderer, input };
+
+function syncViewport() {
+  input.setViewport(renderer.view.scale, renderer.view.offsetX, renderer.view.offsetY);
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+function unlockAudio() {
+  game.sound.unlock();
+  syncViewport();
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
+window.addEventListener('keydown', unlockAudio, { once: true });
+window.addEventListener('pointerdown', unlockAudio, { once: true });
+window.addEventListener('resize', syncViewport);
+
+function announce(message) {
+  if (statusLine) statusLine.textContent = message;
+}
+
+if (shotName) {
+  stageScene(shotName, game, seed);
+  syncViewport();
   let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+  window.__shotReady = false;
+  function paintShot() {
+    renderer.draw(game, null);
     painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+    if (painted >= 2) window.__shotReady = true;
+    requestAnimationFrame(paintShot);
   }
-  requestAnimationFrame(paint);
+  requestAnimationFrame(paintShot);
+} else {
+  runGame();
 }
 
 function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let lastMode = 'title';
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+  function titleMenu() {
+    const count = 3;
+    if (input.wasPressed('ArrowUp', 'KeyW')) {
+      game.menuSelection = (game.menuSelection + count - 1) % count;
+      game.sound.blip(true);
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
+    if (input.wasPressed('ArrowDown', 'KeyS')) {
+      game.menuSelection = (game.menuSelection + 1) % count;
+      game.sound.blip(true);
+    }
+    if (input.wasPressed('Enter', 'Space', 'Mouse0')) {
+      if (game.menuSelection === 0) {
+        game.newGame();
+        announce('Vice Harbor. Meet Marisol Vega at the garage.');
+      } else if (game.menuSelection === 1) {
+        if (game.hasSaveFile && game.loadGame()) {
+          game.mode = 'play';
+          announce('Continuing your saved game.');
+        } else {
+          game.sound.blip(false);
+          announce('No saved game yet.');
+        }
+      } else {
+        game.mode = 'controls';
+      }
     }
   }
 
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+  function pauseMenu() {
+    if (game.pausePanel !== 'main') {
+      if (input.wasPressed('Escape', 'Enter', 'Space', 'Mouse0')) game.pausePanel = 'main';
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    const count = 5;
+    if (input.wasPressed('ArrowUp', 'KeyW')) {
+      game.menuSelection = (game.menuSelection + count - 1) % count;
+      game.sound.blip(true);
+    }
+    if (input.wasPressed('ArrowDown', 'KeyS')) {
+      game.menuSelection = (game.menuSelection + 1) % count;
+      game.sound.blip(true);
+    }
+    if (input.wasPressed('Escape', 'KeyP')) {
+      game.mode = 'play';
+      return;
+    }
+    if (input.wasPressed('Enter', 'Space', 'Mouse0')) {
+      if (game.menuSelection === 0) game.mode = 'play';
+      else if (game.menuSelection === 1) game.pausePanel = 'controls';
+      else if (game.menuSelection === 2) game.pausePanel = 'stats';
+      else if (game.menuSelection === 3) game.saveGame();
+      else {
+        game.mode = 'title';
+        game.menuSelection = 0;
+        game.hasSaveFile = game.hasSaveFile;
+        game.sound.stopEngine();
+      }
+    }
+  }
+
+  function handleMenus() {
+    if (game.mode === 'title') {
+      titleMenu();
+      return;
+    }
+    if (game.mode === 'controls') {
+      if (input.wasPressed('Escape', 'Enter', 'Space', 'Mouse0')) game.mode = 'title';
+      return;
+    }
+    if (game.mode === 'play') {
+      if (input.wasPressed('KeyM')) game.showCityMap = !game.showCityMap;
+      if (input.wasPressed('Escape', 'KeyP')) {
+        if (game.showCityMap) game.showCityMap = false;
+        else {
+          game.mode = 'paused';
+          game.menuSelection = 0;
+          game.pausePanel = 'main';
+          game.sound.stopEngine();
+          game.sound.setSiren(false);
+        }
+      }
+      return;
+    }
+    if (game.mode === 'paused') {
+      pauseMenu();
+      return;
+    }
+    if (game.mode === 'dead') {
+      if (input.wasPressed('Enter', 'Space', 'Mouse0')) {
+        game.respawnAfterDeath();
+        announce('You woke up at Vidal General.');
+      }
+      return;
+    }
+    if (game.mode === 'busted') {
+      if (input.wasPressed('Enter', 'Space', 'Mouse0')) {
+        game.respawnAfterArrest();
+        announce('Released from Harbor PD.');
+      }
+      return;
+    }
+    if (game.mode === 'failed') {
+      if (input.wasPressed('Enter', 'Space', 'Mouse0')) {
+        retryMission(game);
+        game.mode = 'play';
+      } else if (input.wasPressed('Escape')) {
+        game.mode = 'title';
+        game.menuSelection = 0;
+      }
+    }
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+    const elapsed = Math.min(MAX_FRAME, (now - last) / 1000);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+
+    handleMenus();
+
+    if (game.mode === 'play') {
+      accumulator += elapsed;
+      let steps = 0;
+      while (accumulator >= STEP && steps < 6 && game.mode === 'play') {
+        game.update(STEP, input);
         accumulator -= STEP;
+        steps += 1;
+      }
+      if (game.mode === 'play' && game.missions.status === 'failed') {
+        game.mode = 'failed';
+        game.sound.stopEngine();
+        game.sound.setSiren(false);
       }
     } else {
       accumulator = 0;
+      game.update(elapsed, input);
     }
-    renderer.draw(world.state, screen, best);
+
+    if (game.mode !== lastMode) {
+      lastMode = game.mode;
+      if (game.mode === 'title') announce('Vice Harbor. New game, continue or controls.');
+      else if (game.mode === 'paused') announce('Paused.');
+      else if (game.mode === 'play') announce('Playing.');
+    }
+
+    renderer.draw(game, game.mode === 'play' && !game.showCityMap ? input.mouse : null);
+    input.endFrame();
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+  syncViewport();
+  announce('Vice Harbor. Press Enter to start.');
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();
